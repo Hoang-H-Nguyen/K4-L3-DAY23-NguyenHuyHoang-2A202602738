@@ -24,6 +24,8 @@ import json
 import pathlib
 import sys
 import time
+import os
+from datetime import datetime, timezone
 
 import httpx
 
@@ -35,13 +37,80 @@ LOG = pathlib.Path("reports/failover-events.jsonl")
 
 
 def emit(**kw):
-    """TODO: append 1 dòng JSONL có ts + iso vào LOG, và print ra stdout."""
-    raise NotImplementedError
+    """Ghi một sự kiện failover với timestamp vào JSONL."""
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    record = {"ts": time.time(), "iso": datetime.now(timezone.utc).isoformat(), **kw}
+    with LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+        f.flush()
+    print(json.dumps(record, ensure_ascii=False))
+    return record
+
+
+def state_of(region: str) -> dict:
+    response = httpx.get(f"{URL[region]}/v1/state", timeout=2.0)
+    response.raise_for_status()
+    return response.json()
 
 
 def failover(target: str, backend: str, wait: float) -> dict:
-    """TODO: 5 bước ở trên, đúng thứ tự."""
-    raise NotImplementedError
+    """Khôi phục và xác minh target trước khi chuyển edge sang region đó."""
+    if target not in URL:
+        raise ValueError("target phải là a hoặc b")
+    if wait <= 0:
+        raise ValueError("wait phải > 0")
+    emit(step="1_verify_target", target=target, state=state_of(target))
+
+    try:
+        meta = snapshot.get(target, backend)
+    except (Exception, SystemExit) as exc:
+        emit(step="2_restore_snapshot", target=target, ok=False, error=str(exc))
+        return {"ok": False, "target": target, "reason": f"snapshot restore failed: {exc}"}
+    restored = pathlib.Path(f"state/region-{target}/vectors.sqlite")
+    source = "b" if target == "a" else "a"
+    primary = pathlib.Path(f"state/region-{source}/vectors.sqlite")
+    rpo = snapshot.rpo(primary, restored)
+    emit(step="2_restore_snapshot", target=target, ok=True,
+         rpo_seconds=rpo["rpo_seconds"], docs_lost=rpo["docs_lost"],
+         embed_model_version=meta.get("embed_model_version"), snapshot_at=meta.get("snapshot_at"),
+         restored_at=meta.get("restored_at"))
+
+    pool_file = pathlib.Path(f"state/region-{target}/pool_state")
+    pool_file.parent.mkdir(parents=True, exist_ok=True)
+    pool_file.write_text("full\n")
+    emit(step="3_scale_pool", target=target, pool_state="full")
+
+    ready_deadline = time.monotonic() + wait
+    last_body, last_status = {}, None
+    while time.monotonic() < ready_deadline:
+        try:
+            response = httpx.get(f"{URL[target]}/readyz", timeout=min(2.0, max(0.1, wait)))
+            last_status = response.status_code
+            try:
+                last_body = response.json()
+            except ValueError:
+                last_body = {"body": response.text[:200]}
+            if response.status_code == 200:
+                emit(step="4_wait_ready", target=target, ok=True, status_code=200,
+                     waited_s=round(wait - max(0.0, ready_deadline - time.monotonic()), 2),
+                     ready=last_body)
+                edge = pathlib.Path("edge/active_region")
+                edge.parent.mkdir(parents=True, exist_ok=True)
+                edge.write_text(target + "\n")
+                emit(step="5_dns_cutover", target=target, ok=True,
+                     active_region=target,
+                     ttl_s=float(os.environ.get("EDGE_TTL_SECONDS", "5")))
+                return {"ok": True, "target": target, "state": state_of(target),
+                        "rpo_seconds": rpo["rpo_seconds"], "docs_lost": rpo["docs_lost"],
+                        "embed_model_version": meta.get("embed_model_version"),
+                        "cutover": {"ok": True, "active_region": target}}
+        except httpx.HTTPError as exc:
+            last_body = {"error": type(exc).__name__}
+        time.sleep(min(0.25, max(0.0, ready_deadline - time.monotonic())))
+    emit(step="4_wait_ready", target=target, ok=False, status_code=last_status,
+         waited_s=wait, ready=last_body)
+    return {"ok": False, "target": target, "reason": "target did not become ready before timeout",
+            "ready": last_body, "rpo_seconds": rpo["rpo_seconds"], "docs_lost": rpo["docs_lost"]}
 
 
 if __name__ == "__main__":

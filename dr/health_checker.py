@@ -22,6 +22,7 @@ import argparse
 import json
 import pathlib
 import time
+from datetime import datetime, timezone
 
 import httpx
 
@@ -29,13 +30,54 @@ URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
 
 def probe(region: str, timeout: float) -> tuple[bool, str]:
-    """TODO: trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
-    raise NotImplementedError
+    """Trả về readiness và lý do, với timeout cho trường hợp netblock."""
+    try:
+        response = httpx.get(f"{URL[region]}/readyz", timeout=timeout)
+        if response.status_code == 200:
+            return True, "ready"
+        try:
+            body = response.json()
+            reason = ",".join(body.get("reasons", [])) or f"http_{response.status_code}"
+        except (ValueError, TypeError):
+            reason = f"http_{response.status_code}"
+        return False, reason
+    except httpx.TimeoutException:
+        return False, "probe_timeout"
+    except httpx.HTTPError as exc:
+        return False, type(exc).__name__
 
 
 def run(interval: float, timeout: float, threshold: int, duration: float, out: pathlib.Path):
-    """TODO: vòng lặp poll + phát hiện transition + ghi JSONL."""
-    raise NotImplementedError
+    """Poll hai region và chỉ ghi JSONL khi trạng thái chuyển đổi."""
+    if interval <= 0 or timeout <= 0 or threshold < 1 or duration < 0:
+        raise ValueError("interval/timeout phải > 0, threshold >= 1, duration >= 0")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # Start unknown: successes establish a healthy baseline without emitting a
+    # transition. Initial failures still need the full threshold to go unhealthy.
+    states = {r: None for r in URL}
+    failures = {r: 0 for r in URL}
+    deadline = time.monotonic() + duration
+    with out.open("a", encoding="utf-8") as f:
+        while time.monotonic() < deadline:
+            cycle_start = time.monotonic()
+            for region in URL:
+                ready, reason = probe(region, timeout)
+                if ready:
+                    failures[region] = 0
+                    new_state = "HEALTHY" if states[region] == "UNHEALTHY" else None
+                else:
+                    failures[region] += 1
+                    new_state = "UNHEALTHY" if failures[region] >= threshold else None
+                if new_state is not None and states[region] != new_state:
+                    record = {"ts": time.time(), "iso": datetime.now(timezone.utc).isoformat(),
+                              "event": "state_change", "region": region, "to": new_state,
+                              "reason": reason, "interval_s": interval, "threshold": threshold,
+                              "consecutive_fails": failures[region]}
+                    f.write(json.dumps(record) + "\n")
+                    f.flush()
+                    print(json.dumps(record))
+                    states[region] = new_state
+            time.sleep(max(0.0, interval - (time.monotonic() - cycle_start)))
 
 
 if __name__ == "__main__":
